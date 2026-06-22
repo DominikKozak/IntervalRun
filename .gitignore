@@ -1,0 +1,16 @@
+.DS_Store
+*.swp
+*.tmp
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+
+# Swift Package Manager
+.build/
+
+# App
+*.ipa
