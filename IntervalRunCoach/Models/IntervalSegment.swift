@@ -46,4 +46,12 @@ extension Array where Element == IntervalSegment {
         IntervalSegment(title: "Beh", durationSeconds: 60, cueRole: .run),
         IntervalSegment(title: "Chuze", durationSeconds: 180, cueRole: .walk)
     ]
+
+    static func starterIntervals(for language: ResolvedAppLanguage) -> [IntervalSegment] {
+        let text = AppText(language: language)
+        return [
+            IntervalSegment(title: text.runIntervalTitle, durationSeconds: 60, cueRole: .run),
+            IntervalSegment(title: text.walkIntervalTitle, durationSeconds: 180, cueRole: .walk)
+        ]
+    }
 }

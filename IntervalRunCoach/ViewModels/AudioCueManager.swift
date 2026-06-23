@@ -16,7 +16,7 @@ final class AudioCueManager: NSObject, AVSpeechSynthesizerDelegate {
         phrase: String,
         audioMode: AudioMode,
         announcementType: AnnouncementType,
-        language: AnnouncementLanguage,
+        voiceLanguage: VoiceLanguage,
         voiceIdentifier: String?
     ) {
         guard announcementType != .off else { return }
@@ -28,7 +28,7 @@ final class AudioCueManager: NSObject, AVSpeechSynthesizerDelegate {
         }
 
         if announcementType.includesVoice {
-            speak(phrase, language: language, voiceIdentifier: voiceIdentifier)
+            speak(phrase, voiceLanguage: voiceLanguage, voiceIdentifier: voiceIdentifier)
         }
     }
 
@@ -36,12 +36,12 @@ final class AudioCueManager: NSObject, AVSpeechSynthesizerDelegate {
         _ text: String,
         audioMode: AudioMode,
         announcementType: AnnouncementType,
-        language: AnnouncementLanguage,
+        voiceLanguage: VoiceLanguage,
         voiceIdentifier: String?
     ) {
         guard announcementType.includesVoice else { return }
         configureSession(for: audioMode)
-        speak(text, language: language, voiceIdentifier: voiceIdentifier)
+        speak(text, voiceLanguage: voiceLanguage, voiceIdentifier: voiceIdentifier)
     }
 
     private func configureSession(for audioMode: AudioMode) {
@@ -90,22 +90,22 @@ final class AudioCueManager: NSObject, AVSpeechSynthesizerDelegate {
         }
     }
 
-    private func speak(_ text: String, language: AnnouncementLanguage, voiceIdentifier: String?) {
+    private func speak(_ text: String, voiceLanguage: VoiceLanguage, voiceIdentifier: String?) {
         let utterance = AVSpeechUtterance(string: text)
-        utterance.voice = bestVoice(for: language, preferredIdentifier: voiceIdentifier)
-        utterance.rate = language == .english ? 0.46 : 0.43
+        utterance.voice = bestVoice(for: voiceLanguage, preferredIdentifier: voiceIdentifier)
+        utterance.rate = 0.46
         utterance.pitchMultiplier = 0.92
         utterance.volume = 1
         synthesizer.speak(utterance)
     }
 
-    private func bestVoice(for language: AnnouncementLanguage, preferredIdentifier: String?) -> AVSpeechSynthesisVoice? {
+    private func bestVoice(for voiceLanguage: VoiceLanguage, preferredIdentifier: String?) -> AVSpeechSynthesisVoice? {
         if let preferredIdentifier,
            let preferredVoice = AVSpeechSynthesisVoice(identifier: preferredIdentifier) {
             return preferredVoice
         }
 
-        let exactLanguage = language.localeIdentifier
+        let exactLanguage = voiceLanguage.localeIdentifier
         let matchingVoices = AVSpeechSynthesisVoice.speechVoices()
             .filter { $0.language == exactLanguage }
             .sorted { lhs, rhs in

@@ -15,9 +15,10 @@ final class WorkoutViewModel: NSObject, ObservableObject {
     @Published var countdownToStart = 0
     @Published var audioMode: AudioMode = .duck
     @Published var announcementType: AnnouncementType = .voiceAndSound
-    @Published var announcementLanguage: AnnouncementLanguage = .czech
+    @Published var appLanguage: AppLanguageSetting = .system
+    @Published var voiceLanguage: VoiceLanguage = .english
     @Published var voiceIdentifier: String?
-    @Published var notificationPermissionState = "Nezjisteno"
+    @Published private(set) var notificationPermissionStatus: NotificationPermissionStatus = .unknown
 
     private let saveKey = "savedWorkoutConfig"
     private let maxScheduledNotifications = 64
@@ -28,6 +29,14 @@ final class WorkoutViewModel: NSObject, ObservableObject {
 
     var isWorkoutActive: Bool {
         isRunning || isPaused || countdownToStart > 0
+    }
+
+    var resolvedAppLanguage: ResolvedAppLanguage {
+        appLanguage.resolved
+    }
+
+    var text: AppText {
+        AppText(language: resolvedAppLanguage)
     }
 
     override init() {
@@ -104,23 +113,34 @@ final class WorkoutViewModel: NSObject, ObservableObject {
     var roundSummaryText: String {
         switch repeatMode {
         case .unlimited:
-            return "Kolo \(currentRound)"
+            return "\(text.round) \(currentRound)"
         case .fixedRounds:
-            return "Kolo \(currentRound)/\(rounds)"
+            return "\(text.round) \(currentRound)/\(rounds)"
         }
     }
 
     var remainingSummaryText: String {
         switch repeatMode {
         case .unlimited:
-            return "Neomezene"
+            return text.unlimited
         case .fixedRounds:
             return format(seconds: totalRemainingSeconds)
         }
     }
 
+    var notificationPermissionText: String {
+        switch notificationPermissionStatus {
+        case .allowed:
+            return text.permissionAllowed
+        case .denied:
+            return text.permissionDenied
+        case .unknown:
+            return text.permissionUnknown
+        }
+    }
+
     func addSegment() {
-        segments.append(IntervalSegment(title: "Novy interval", durationSeconds: 60))
+        segments.append(IntervalSegment(title: text.newIntervalTitle, durationSeconds: 60))
         syncIdlePreviewState()
         save()
     }
@@ -128,7 +148,7 @@ final class WorkoutViewModel: NSObject, ObservableObject {
     func removeSegments(at offsets: IndexSet) {
         segments.remove(atOffsets: offsets)
         if segments.isEmpty {
-            segments = .starterIntervals
+            segments = .starterIntervals(for: resolvedAppLanguage)
         }
         syncIdlePreviewState()
         save()
@@ -136,6 +156,18 @@ final class WorkoutViewModel: NSObject, ObservableObject {
 
     func moveSegments(from source: IndexSet, to destination: Int) {
         segments.move(fromOffsets: source, toOffset: destination)
+        syncIdlePreviewState()
+        save()
+    }
+
+    func moveSegment(draggedID: UUID, over targetID: UUID) {
+        guard !isWorkoutActive,
+              draggedID != targetID,
+              let sourceIndex = segments.firstIndex(where: { $0.id == draggedID }),
+              let targetIndex = segments.firstIndex(where: { $0.id == targetID }) else { return }
+
+        let segment = segments.remove(at: sourceIndex)
+        segments.insert(segment, at: targetIndex)
         syncIdlePreviewState()
         save()
     }
@@ -215,16 +247,19 @@ final class WorkoutViewModel: NSObject, ObservableObject {
     private func load() {
         if let data = UserDefaults.standard.data(forKey: saveKey),
            let saved = try? JSONDecoder().decode(SavedWorkoutConfig.self, from: data) {
-            segments = saved.segments.isEmpty ? .starterIntervals : saved.segments
             repeatMode = saved.repeatMode
             rounds = max(1, saved.rounds)
             audioMode = saved.audioMode
             announcementType = saved.announcementType
-            announcementLanguage = saved.announcementLanguage
+            appLanguage = saved.appLanguage
+            voiceLanguage = saved.voiceLanguage
             voiceIdentifier = saved.voiceIdentifier
+            segments = saved.segments.isEmpty ? .starterIntervals(for: resolvedAppLanguage) : saved.segments
         } else {
-            segments = .starterIntervals
             repeatMode = .unlimited
+            appLanguage = .system
+            voiceLanguage = .english
+            segments = .starterIntervals(for: resolvedAppLanguage)
         }
 
         secondsRemaining = segments.first?.durationSeconds ?? 0
@@ -237,7 +272,8 @@ final class WorkoutViewModel: NSObject, ObservableObject {
             repeatMode: repeatMode,
             audioMode: audioMode,
             announcementType: announcementType,
-            announcementLanguage: announcementLanguage,
+            appLanguage: appLanguage,
+            voiceLanguage: voiceLanguage,
             voiceIdentifier: voiceIdentifier
         )
 
@@ -271,7 +307,7 @@ final class WorkoutViewModel: NSObject, ObservableObject {
                     "\(countdownToStart)",
                     audioMode: audioMode,
                     announcementType: announcementType,
-                    language: announcementLanguage,
+                    voiceLanguage: voiceLanguage,
                     voiceIdentifier: voiceIdentifier
                 )
             }
@@ -323,7 +359,7 @@ final class WorkoutViewModel: NSObject, ObservableObject {
             phrase: finishPhrase,
             audioMode: audioMode,
             announcementType: announcementType,
-            language: announcementLanguage,
+            voiceLanguage: voiceLanguage,
             voiceIdentifier: voiceIdentifier
         )
     }
@@ -337,29 +373,31 @@ final class WorkoutViewModel: NSObject, ObservableObject {
             phrase: message,
             audioMode: audioMode,
             announcementType: announcementType,
-            language: announcementLanguage,
+            voiceLanguage: voiceLanguage,
             voiceIdentifier: voiceIdentifier
         )
     }
 
     private var finishPhrase: String {
-        switch announcementLanguage {
-        case .czech:
-            return "Hotovo. Trenink skoncil."
-        case .english:
-            return "Done. Workout finished."
-        }
+        return "Done. Workout finished."
     }
 
     private func announcementPhrase(prefix: String, segment: IntervalSegment) -> String {
-        let title = segment.displayTitle.lowercased()
+        let englishPrefix = prefix == "Start" ? "Start" : "Now"
+        let spokenTitle = englishCueTitle(for: segment)
+        return "\(englishPrefix) \(spokenTitle)"
+    }
 
-        switch announcementLanguage {
-        case .czech:
-            return "\(prefix) \(title)"
-        case .english:
-            let englishPrefix = prefix == "Start" ? "Start" : "Now"
-            return "\(englishPrefix) \(title)"
+    private func englishCueTitle(for segment: IntervalSegment) -> String {
+        switch segment.cueRole {
+        case .run:
+            return "run"
+        case .walk:
+            return "walk"
+        case .finish:
+            return "finish"
+        case .neutral:
+            return segment.displayTitle.lowercased()
         }
     }
 
@@ -383,12 +421,12 @@ final class WorkoutViewModel: NSObject, ObservableObject {
                 content.sound = .default
 
                 if isLastSegment {
-                    content.title = "Trenink dokoncen"
-                    content.body = "Hotovo. Skvela prace."
+                    content.title = notificationFinishedTitle
+                    content.body = notificationFinishedBody
                 } else {
                     let nextTitle = nextTitleAfter(round: roundIndex, segment: segmentIndex)
-                    content.title = "Zmena intervalu"
-                    content.body = "Ted \(nextTitle.lowercased())."
+                    content.title = notificationChangeTitle
+                    content.body = "\(text.next) \(nextTitle.lowercased())."
                 }
 
                 let trigger = UNTimeIntervalNotificationTrigger(timeInterval: TimeInterval(elapsed), repeats: false)
@@ -416,10 +454,43 @@ final class WorkoutViewModel: NSObject, ObservableObject {
         }
 
         if repeatMode == .unlimited || round + 1 < rounds {
-            return segments.first?.displayTitle ?? "Dalsi interval"
+            return segments.first?.displayTitle ?? text.intervals
         }
 
-        return "Konec"
+        return text.finish
+    }
+
+    private var notificationFinishedTitle: String {
+        switch resolvedAppLanguage {
+        case .czech:
+            return "Trenink dokoncen"
+        case .english:
+            return "Workout complete"
+        case .slovak:
+            return "Trening dokonceny"
+        }
+    }
+
+    private var notificationFinishedBody: String {
+        switch resolvedAppLanguage {
+        case .czech:
+            return "Hotovo. Skvela prace."
+        case .english:
+            return "Done. Great work."
+        case .slovak:
+            return "Hotovo. Skvela praca."
+        }
+    }
+
+    private var notificationChangeTitle: String {
+        switch resolvedAppLanguage {
+        case .czech:
+            return "Zmena intervalu"
+        case .english:
+            return "Interval change"
+        case .slovak:
+            return "Zmena intervalu"
+        }
     }
 
     private func scheduledNotificationIDs() -> [String] {
@@ -452,8 +523,8 @@ final class WorkoutViewModel: NSObject, ObservableObject {
     func applyPreset(runSeconds: Int, walkSeconds: Int, rounds: Int) {
         guard !isRunning, !isPaused else { return }
         self.segments = [
-            IntervalSegment(title: "Beh", durationSeconds: runSeconds, cueRole: .run),
-            IntervalSegment(title: "Chuze", durationSeconds: walkSeconds, cueRole: .walk)
+            IntervalSegment(title: text.runIntervalTitle, durationSeconds: runSeconds, cueRole: .run),
+            IntervalSegment(title: text.walkIntervalTitle, durationSeconds: walkSeconds, cueRole: .walk)
         ]
         self.repeatMode = .fixedRounds
         self.rounds = max(1, rounds)
@@ -469,13 +540,13 @@ final class WorkoutViewModel: NSObject, ObservableObject {
         let settings = await notificationCenter.notificationSettings()
         switch settings.authorizationStatus {
         case .authorized, .provisional, .ephemeral:
-            notificationPermissionState = "Povoleno"
+            notificationPermissionStatus = .allowed
         case .denied:
-            notificationPermissionState = "Zakazano"
+            notificationPermissionStatus = .denied
         case .notDetermined:
-            notificationPermissionState = "Nezjisteno"
+            notificationPermissionStatus = .unknown
         @unknown default:
-            notificationPermissionState = "Nezname"
+            notificationPermissionStatus = .unknown
         }
     }
 
@@ -487,13 +558,20 @@ final class WorkoutViewModel: NSObject, ObservableObject {
     }
 }
 
+enum NotificationPermissionStatus {
+    case allowed
+    case denied
+    case unknown
+}
+
 private struct SavedWorkoutConfig: Codable {
     var segments: [IntervalSegment]
     var rounds: Int
     var repeatMode: RepeatMode
     var audioMode: AudioMode
     var announcementType: AnnouncementType
-    var announcementLanguage: AnnouncementLanguage
+    var appLanguage: AppLanguageSetting
+    var voiceLanguage: VoiceLanguage
     var voiceIdentifier: String?
 
     private enum CodingKeys: String, CodingKey {
@@ -502,6 +580,8 @@ private struct SavedWorkoutConfig: Codable {
         case repeatMode
         case audioMode
         case announcementType
+        case appLanguage
+        case voiceLanguage
         case announcementLanguage
         case voiceIdentifier
         case enableVoice
@@ -514,7 +594,8 @@ private struct SavedWorkoutConfig: Codable {
         repeatMode: RepeatMode,
         audioMode: AudioMode,
         announcementType: AnnouncementType,
-        announcementLanguage: AnnouncementLanguage,
+        appLanguage: AppLanguageSetting,
+        voiceLanguage: VoiceLanguage,
         voiceIdentifier: String?
     ) {
         self.segments = segments
@@ -522,7 +603,8 @@ private struct SavedWorkoutConfig: Codable {
         self.repeatMode = repeatMode
         self.audioMode = audioMode
         self.announcementType = announcementType
-        self.announcementLanguage = announcementLanguage
+        self.appLanguage = appLanguage
+        self.voiceLanguage = voiceLanguage
         self.voiceIdentifier = voiceIdentifier
     }
 
@@ -533,8 +615,16 @@ private struct SavedWorkoutConfig: Codable {
         rounds = try container.decodeIfPresent(Int.self, forKey: .rounds) ?? 6
         repeatMode = try container.decodeIfPresent(RepeatMode.self, forKey: .repeatMode) ?? .unlimited
         audioMode = try container.decodeIfPresent(AudioMode.self, forKey: .audioMode) ?? .duck
-        announcementLanguage = try container.decodeIfPresent(AnnouncementLanguage.self, forKey: .announcementLanguage) ?? .czech
+        voiceLanguage = try container.decodeIfPresent(VoiceLanguage.self, forKey: .voiceLanguage) ?? .english
         voiceIdentifier = try container.decodeIfPresent(String.self, forKey: .voiceIdentifier)
+
+        if let savedAppLanguage = try container.decodeIfPresent(AppLanguageSetting.self, forKey: .appLanguage) {
+            appLanguage = savedAppLanguage
+        } else if let oldAnnouncementLanguage = try container.decodeIfPresent(String.self, forKey: .announcementLanguage) {
+            appLanguage = oldAnnouncementLanguage == "english" ? .english : .czech
+        } else {
+            appLanguage = .system
+        }
 
         if let savedAnnouncementType = try container.decodeIfPresent(AnnouncementType.self, forKey: .announcementType) {
             announcementType = savedAnnouncementType
@@ -562,7 +652,8 @@ private struct SavedWorkoutConfig: Codable {
         try container.encode(repeatMode, forKey: .repeatMode)
         try container.encode(audioMode, forKey: .audioMode)
         try container.encode(announcementType, forKey: .announcementType)
-        try container.encode(announcementLanguage, forKey: .announcementLanguage)
+        try container.encode(appLanguage, forKey: .appLanguage)
+        try container.encode(voiceLanguage, forKey: .voiceLanguage)
         try container.encodeIfPresent(voiceIdentifier, forKey: .voiceIdentifier)
     }
 }

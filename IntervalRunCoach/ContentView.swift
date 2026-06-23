@@ -1,7 +1,14 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var viewModel = WorkoutViewModel()
+    @State private var isShowingSettings = false
+    @State private var draggingSegmentID: UUID?
+
+    private var text: AppText {
+        viewModel.text
+    }
 
     var body: some View {
         NavigationStack {
@@ -27,11 +34,6 @@ struct ContentView: View {
                         .listRowBackground(Color.clear)
                         .listRowInsets(EdgeInsets(top: 6, leading: 20, bottom: 10, trailing: 20))
 
-                    settingsCard
-                        .listRowSeparator(.hidden)
-                        .listRowBackground(Color.clear)
-                        .listRowInsets(EdgeInsets(top: 6, leading: 20, bottom: 10, trailing: 20))
-
                     intervalHeader
                         .listRowSeparator(.hidden)
                         .listRowBackground(Color.clear)
@@ -41,6 +43,7 @@ struct ContentView: View {
                         IntervalRow(
                             segment: segment,
                             isDisabled: viewModel.isWorkoutActive,
+                            text: text,
                             onChange: { title, minutes, seconds in
                                 viewModel.updateSegment(
                                     id: segment.id,
@@ -54,11 +57,23 @@ struct ContentView: View {
                             }
                         )
                         .moveDisabled(viewModel.isWorkoutActive)
+                        .onDrag {
+                            guard !viewModel.isWorkoutActive else { return NSItemProvider() }
+                            draggingSegmentID = segment.id
+                            return NSItemProvider(object: segment.id.uuidString as NSString)
+                        }
+                        .onDrop(
+                            of: [UTType.text],
+                            delegate: IntervalDropDelegate(
+                                targetID: segment.id,
+                                draggingID: $draggingSegmentID,
+                                viewModel: viewModel
+                            )
+                        )
                         .listRowSeparator(.hidden)
                         .listRowBackground(Color.clear)
                         .listRowInsets(EdgeInsets(top: 6, leading: 20, bottom: 6, trailing: 20))
                     }
-                    .onMove(perform: viewModel.moveSegments)
 
                     addIntervalButton
                         .listRowSeparator(.hidden)
@@ -71,11 +86,21 @@ struct ContentView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    EditButton()
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(AppPalette.deepOlive)
+                    Button {
+                        isShowingSettings = true
+                    } label: {
+                        Image(systemName: "gearshape")
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(AppPalette.deepOlive)
+                            .frame(width: 42, height: 42)
+                            .background(AppPalette.linen.opacity(0.86), in: Circle())
+                    }
+                    .accessibilityLabel(text.settingsButtonLabel)
                         .disabled(viewModel.isWorkoutActive)
                 }
+            }
+            .sheet(isPresented: $isShowingSettings) {
+                settingsSheet
             }
         }
         .tint(AppPalette.clockwork)
@@ -114,7 +139,7 @@ struct ContentView: View {
                 .font(.system(size: 48, weight: .regular, design: .serif))
                 .foregroundStyle(AppPalette.deepOlive)
 
-            Text("Run Coach")
+            Text(text.appSubtitle)
                 .font(.system(size: 18, weight: .semibold, design: .rounded))
                 .tracking(1.8)
                 .textCase(.uppercase)
@@ -147,22 +172,22 @@ struct ContentView: View {
                 .font(.system(size: 68, weight: .bold, design: .serif))
                 .monospacedDigit()
                 .foregroundStyle(AppPalette.linen)
-                .accessibilityLabel("Zbyvajici cas")
+                .accessibilityLabel(text.remainingTimeAccessibility)
                 .accessibilityValue(primaryTimeText)
 
             VStack(alignment: .leading, spacing: 9) {
                 ProgressView(value: viewModel.progress)
                     .tint(AppPalette.latte)
-                    .accessibilityLabel("Prubeh treninku")
-                    .accessibilityValue("\(Int(viewModel.progress * 100)) procent")
+                    .accessibilityLabel(text.progressAccessibility)
+                    .accessibilityValue(text.progressValue(viewModel.progress))
 
                 HStack {
-                    Label("Zbyva \(viewModel.remainingSummaryText)", systemImage: "hourglass")
+                    Label("\(text.remaining) \(viewModel.remainingSummaryText)", systemImage: "hourglass")
                     Spacer()
                     if let next = viewModel.nextSegment, viewModel.isRunning {
-                        Text("Dalsi: \(next.displayTitle)")
+                        Text("\(text.next): \(next.displayTitle)")
                     } else if viewModel.countdownToStart > 0 {
-                        Text("Priprav se")
+                        Text(text.prepare)
                     }
                 }
                 .font(.footnote.weight(.medium))
@@ -171,18 +196,18 @@ struct ContentView: View {
 
             HStack(spacing: 12) {
                 if viewModel.isWorkoutActive {
-                    Button("Finish") {
+                    Button(text.finish) {
                         viewModel.finishWorkout()
                     }
                     .buttonStyle(FilledCapsuleButtonStyle(background: AppPalette.latte, foreground: AppPalette.cafeNoir))
                 } else {
-                    Button("Start") {
+                    Button(text.start) {
                         viewModel.startWorkout()
                     }
                     .buttonStyle(FilledCapsuleButtonStyle(background: AppPalette.latte, foreground: AppPalette.cafeNoir))
                 }
 
-                Button(viewModel.isPaused ? "Pokracovat" : "Pauza") {
+                Button(viewModel.isPaused ? text.resume : text.pause) {
                     viewModel.pauseOrResumeWorkout()
                 }
                 .buttonStyle(OutlineCapsuleButtonStyle())
@@ -190,13 +215,13 @@ struct ContentView: View {
             }
 
             if viewModel.isWorkoutActive {
-                Button("Reset bez dokonceni") {
+                Button(text.resetWithoutFinish) {
                     if viewModel.isWorkoutActive {
                         viewModel.resetWorkout()
                     }
                 }
                 .buttonStyle(OutlineCapsuleButtonStyle())
-                .accessibilityHint("Zrusi trenink bez finish zvuku")
+                .accessibilityHint(text.resetHint)
             }
         }
         .padding(22)
@@ -217,17 +242,17 @@ struct ContentView: View {
 
     private var presetsCard: some View {
         VStack(alignment: .leading, spacing: 14) {
-            SectionLabel("Rychle presety")
+            SectionLabel(text.quickPresets)
 
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 12) {
-                    presetButton(title: "1 / 3", subtitle: "8 kol", color: AppPalette.clockwork) {
+                    presetButton(title: "1 / 3", subtitle: "8 \(text.roundsShort)", color: AppPalette.clockwork) {
                         viewModel.applyPreset(runSeconds: 60, walkSeconds: 180, rounds: 8)
                     }
-                    presetButton(title: "2 / 2", subtitle: "8 kol", color: AppPalette.cedar) {
+                    presetButton(title: "2 / 2", subtitle: "8 \(text.roundsShort)", color: AppPalette.cedar) {
                         viewModel.applyPreset(runSeconds: 120, walkSeconds: 120, rounds: 8)
                     }
-                    presetButton(title: "3 / 1", subtitle: "10 kol", color: AppPalette.mauve) {
+                    presetButton(title: "3 / 1", subtitle: "10 \(text.roundsShort)", color: AppPalette.mauve) {
                         viewModel.applyPreset(runSeconds: 180, walkSeconds: 60, rounds: 10)
                     }
                 }
@@ -237,18 +262,37 @@ struct ContentView: View {
         .cardStyle()
     }
 
+    private var settingsSheet: some View {
+        NavigationStack {
+            ZStack {
+                backgroundTexture
+
+                ScrollView {
+                    settingsCard
+                        .padding(.horizontal, 20)
+                        .padding(.top, 20)
+                        .padding(.bottom, 28)
+                }
+            }
+            .navigationTitle(text.settingsTitle)
+            .navigationBarTitleDisplayMode(.inline)
+        }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+    }
+
     private var settingsCard: some View {
         VStack(alignment: .leading, spacing: 16) {
-            SectionLabel("Nastaveni")
+            SectionLabel(text.settingsTitle)
 
             VStack(alignment: .leading, spacing: 10) {
-                Text("Opakovani")
+                Text(text.repeatTitle)
                     .font(.system(.body, design: .rounded).weight(.medium))
                     .foregroundStyle(AppPalette.deepOlive)
 
-                Picker("Opakovani", selection: $viewModel.repeatMode) {
+                Picker(text.repeatTitle, selection: $viewModel.repeatMode) {
                     ForEach(RepeatMode.allCases) { mode in
-                        Text(mode.title).tag(mode)
+                        Text(mode.title(in: text)).tag(mode)
                     }
                 }
                 .pickerStyle(.segmented)
@@ -259,7 +303,7 @@ struct ContentView: View {
             }
 
             if viewModel.repeatMode == .fixedRounds {
-                Stepper("Pocet kol: \(viewModel.rounds)", value: $viewModel.rounds, in: 1...30)
+                Stepper(text.roundsCount(viewModel.rounds), value: $viewModel.rounds, in: 1...30)
                     .font(.system(.body, design: .rounded).weight(.medium))
                     .foregroundStyle(AppPalette.deepOlive)
                     .onChange(of: viewModel.rounds) { _, _ in
@@ -270,10 +314,10 @@ struct ContentView: View {
 
             Divider().overlay(AppPalette.cedar.opacity(0.24))
 
-            PickerRow(title: "Hudba", selectionTitle: viewModel.audioMode.title) {
-                Picker("Hudba", selection: $viewModel.audioMode) {
+            PickerRow(title: text.music, selectionTitle: viewModel.audioMode.title(in: text)) {
+                Picker(text.music, selection: $viewModel.audioMode) {
                     ForEach(AudioMode.allCases) { mode in
-                        Text(mode.title).tag(mode)
+                        Text(mode.title(in: text)).tag(mode)
                     }
                 }
                 .onChange(of: viewModel.audioMode) { _, _ in
@@ -282,10 +326,10 @@ struct ContentView: View {
             }
             .disabled(viewModel.isWorkoutActive)
 
-            PickerRow(title: "Hlaseni", selectionTitle: viewModel.announcementType.title) {
-                Picker("Hlaseni", selection: $viewModel.announcementType) {
+            PickerRow(title: text.announcements, selectionTitle: viewModel.announcementType.title(in: text)) {
+                Picker(text.announcements, selection: $viewModel.announcementType) {
                     ForEach(AnnouncementType.allCases) { type in
-                        Text(type.title).tag(type)
+                        Text(type.title(in: text)).tag(type)
                     }
                 }
                 .onChange(of: viewModel.announcementType) { _, _ in
@@ -294,39 +338,45 @@ struct ContentView: View {
             }
             .disabled(viewModel.isWorkoutActive)
 
-            PickerRow(title: "Jazyk", selectionTitle: viewModel.announcementLanguage.title) {
-                Picker("Jazyk", selection: $viewModel.announcementLanguage) {
-                    ForEach(AnnouncementLanguage.allCases) { language in
-                        Text(language.title).tag(language)
+            PickerRow(title: text.appLanguage, selectionTitle: viewModel.appLanguage.title(in: text)) {
+                Picker(text.appLanguage, selection: $viewModel.appLanguage) {
+                    ForEach(AppLanguageSetting.allCases) { language in
+                        Text(language.title(in: text)).tag(language)
                     }
                 }
-                .onChange(of: viewModel.announcementLanguage) { _, _ in
+                .onChange(of: viewModel.appLanguage) { _, _ in
                     viewModel.save()
                 }
             }
             .disabled(viewModel.isWorkoutActive)
 
+            StaticInfoRow(title: text.voiceLanguage, value: viewModel.voiceLanguage.title)
+
+            Text(text.voiceLanguageNote)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(AppPalette.clockwork.opacity(0.78))
+
             HStack(alignment: .center, spacing: 12) {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Notifikace")
+                    Text(text.notifications)
                         .font(.system(.body, design: .rounded).weight(.medium))
                         .foregroundStyle(AppPalette.deepOlive)
-                    Text(viewModel.notificationPermissionState)
+                    Text(viewModel.notificationPermissionText)
                         .font(.caption.weight(.medium))
                         .foregroundStyle(AppPalette.clockwork.opacity(0.78))
                 }
 
                 Spacer()
 
-                if viewModel.notificationPermissionState == "Povoleno" {
-                    Text("Aktivni")
+                if viewModel.notificationPermissionStatus == .allowed {
+                    Text(text.active)
                         .font(.system(.subheadline, design: .rounded).weight(.bold))
                         .padding(.horizontal, 16)
                         .padding(.vertical, 11)
                         .foregroundStyle(AppPalette.linen)
                         .background(AppPalette.deepOlive, in: Capsule())
                 } else {
-                    Button("Povolit") {
+                    Button(text.allow) {
                         viewModel.requestNotificationPermission()
                     }
                     .buttonStyle(FilledCapsuleButtonStyle(background: AppPalette.deepOlive, foreground: AppPalette.linen))
@@ -338,9 +388,9 @@ struct ContentView: View {
 
     private var intervalHeader: some View {
         HStack(alignment: .lastTextBaseline) {
-            SectionLabel("Intervaly")
+            SectionLabel(text.intervals)
             Spacer()
-            Text("Edit pro poradi")
+            Text(text.dragToReorder)
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(AppPalette.clockwork.opacity(0.78))
         }
@@ -350,7 +400,7 @@ struct ContentView: View {
         Button {
             viewModel.addSegment()
         } label: {
-            Label("Pridat interval", systemImage: "plus")
+            Label(text.addInterval, systemImage: "plus")
                 .font(.system(.body, design: .rounded).weight(.semibold))
                 .frame(maxWidth: .infinity)
         }
@@ -360,9 +410,9 @@ struct ContentView: View {
 
     private var statusTitle: String {
         if viewModel.countdownToStart > 0 {
-            return "Priprava"
+            return text.preparing
         }
-        return viewModel.currentSegment?.displayTitle ?? "Pripraveno"
+        return viewModel.currentSegment?.displayTitle ?? text.ready
     }
 
     private var primaryTimeText: String {
@@ -397,9 +447,31 @@ struct ContentView: View {
     ContentView()
 }
 
+@MainActor
+private struct IntervalDropDelegate: DropDelegate {
+    let targetID: UUID
+    @Binding var draggingID: UUID?
+    let viewModel: WorkoutViewModel
+
+    func dropEntered(info: DropInfo) {
+        guard let draggingID else { return }
+        viewModel.moveSegment(draggedID: draggingID, over: targetID)
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        draggingID = nil
+        return true
+    }
+}
+
 private struct IntervalRow: View {
     let segment: IntervalSegment
     let isDisabled: Bool
+    let text: AppText
     let onChange: (String, Int, Int) -> Void
     let onDelete: () -> Void
 
@@ -411,11 +483,13 @@ private struct IntervalRow: View {
     init(
         segment: IntervalSegment,
         isDisabled: Bool,
+        text: AppText,
         onChange: @escaping (String, Int, Int) -> Void,
         onDelete: @escaping () -> Void
     ) {
         self.segment = segment
         self.isDisabled = isDisabled
+        self.text = text
         self.onChange = onChange
         self.onDelete = onDelete
         _title = State(initialValue: segment.title)
@@ -426,7 +500,13 @@ private struct IntervalRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .center, spacing: 12) {
-                TextField("Nazev intervalu", text: $title)
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundStyle(AppPalette.clockwork.opacity(isDisabled ? 0.28 : 0.72))
+                    .frame(width: 28, height: 34)
+                    .accessibilityHidden(true)
+
+                TextField(text.intervalNamePlaceholder, text: $title)
                     .font(.system(size: 28, weight: .regular, design: .serif))
                     .foregroundStyle(AppPalette.deepOlive)
                     .textInputAutocapitalization(.sentences)
@@ -447,16 +527,16 @@ private struct IntervalRow: View {
                         .background(AppPalette.mauve.opacity(0.12), in: Circle())
                 }
                 .disabled(isDisabled)
-                .accessibilityLabel("Smazat interval")
+                .accessibilityLabel(text.deleteInterval)
             }
 
             HStack(spacing: 12) {
-                durationField(title: "Minuty", text: $minutesText)
-                durationField(title: "Sekundy", text: $secondsText)
+                durationField(title: text.minutes, text: $minutesText)
+                durationField(title: text.seconds, text: $secondsText)
             }
 
             HStack {
-                Text("Delka")
+                Text(text.duration)
                 Spacer()
                 Text(formattedDuration)
                     .monospacedDigit()
@@ -588,6 +668,28 @@ private struct PickerRow<PickerContent: View>: View {
                 .foregroundStyle(AppPalette.linen)
                 .background(AppPalette.deepOlive, in: Capsule())
             }
+        }
+    }
+}
+
+private struct StaticInfoRow: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(title)
+                .font(.system(.body, design: .rounded).weight(.medium))
+                .foregroundStyle(AppPalette.deepOlive)
+
+            Spacer()
+
+            Text(value)
+                .font(.system(.subheadline, design: .rounded).weight(.bold))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .foregroundStyle(AppPalette.deepOlive)
+                .background(AppPalette.weathered.opacity(0.18), in: Capsule())
         }
     }
 }
