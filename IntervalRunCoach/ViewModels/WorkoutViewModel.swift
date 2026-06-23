@@ -1,5 +1,3 @@
-import AudioToolbox
-import AVFoundation
 import Foundation
 import UIKit
 import UserNotifications
@@ -7,6 +5,7 @@ import UserNotifications
 @MainActor
 final class WorkoutViewModel: NSObject, ObservableObject {
     @Published var segments: [IntervalSegment] = []
+    @Published var repeatMode: RepeatMode = .unlimited
     @Published var rounds: Int = 6
     @Published var isRunning = false
     @Published var isPaused = false
@@ -14,15 +13,22 @@ final class WorkoutViewModel: NSObject, ObservableObject {
     @Published var currentRound = 1
     @Published var secondsRemaining = 0
     @Published var countdownToStart = 0
-    @Published var enableVoice = true
-    @Published var enableSound = true
+    @Published var audioMode: AudioMode = .duck
+    @Published var announcementType: AnnouncementType = .voiceAndSound
+    @Published var announcementLanguage: AnnouncementLanguage = .czech
+    @Published var voiceIdentifier: String?
     @Published var notificationPermissionState = "Nezjisteno"
 
     private let saveKey = "savedWorkoutConfig"
+    private let maxScheduledNotifications = 64
     private let notificationCenter = UNUserNotificationCenter.current()
-    private let speaker = AVSpeechSynthesizer()
+    private let audioCueManager = AudioCueManager()
     private let feedbackGenerator = UINotificationFeedbackGenerator()
     private var timer: Timer?
+
+    var isWorkoutActive: Bool {
+        isRunning || isPaused || countdownToStart > 0
+    }
 
     override init() {
         super.init()
@@ -45,7 +51,7 @@ final class WorkoutViewModel: NSObject, ObservableObject {
             return segments[nextIndex]
         }
 
-        if currentRound < rounds {
+        if repeatMode == .unlimited || currentRound < rounds {
             return segments.first
         }
 
@@ -53,7 +59,10 @@ final class WorkoutViewModel: NSObject, ObservableObject {
     }
 
     var totalWorkoutSeconds: Int {
-        segments.reduce(0) { $0 + $1.durationSeconds } * max(rounds, 1)
+        guard repeatMode == .fixedRounds else {
+            return segments.reduce(0) { $0 + $1.durationSeconds }
+        }
+        return segments.reduce(0) { $0 + $1.durationSeconds } * max(rounds, 1)
     }
 
     var totalWorkoutDescription: String {
@@ -62,6 +71,7 @@ final class WorkoutViewModel: NSObject, ObservableObject {
 
     var totalRemainingSeconds: Int {
         guard !segments.isEmpty else { return 0 }
+        guard repeatMode == .fixedRounds else { return secondsRemaining }
 
         if !isRunning && countdownToStart == 0 {
             return totalWorkoutSeconds
@@ -82,12 +92,36 @@ final class WorkoutViewModel: NSObject, ObservableObject {
     }
 
     var progress: Double {
+        if repeatMode == .unlimited {
+            guard let currentSegment, currentSegment.durationSeconds > 0 else { return 0 }
+            return min(max(Double(currentSegment.durationSeconds - secondsRemaining) / Double(currentSegment.durationSeconds), 0), 1)
+        }
+
         guard totalWorkoutSeconds > 0 else { return 0 }
         return min(max(Double(totalWorkoutSeconds - totalRemainingSeconds) / Double(totalWorkoutSeconds), 0), 1)
     }
 
+    var roundSummaryText: String {
+        switch repeatMode {
+        case .unlimited:
+            return "Kolo \(currentRound)"
+        case .fixedRounds:
+            return "Kolo \(currentRound)/\(rounds)"
+        }
+    }
+
+    var remainingSummaryText: String {
+        switch repeatMode {
+        case .unlimited:
+            return "Neomezene"
+        case .fixedRounds:
+            return format(seconds: totalRemainingSeconds)
+        }
+    }
+
     func addSegment() {
         segments.append(IntervalSegment(title: "Novy interval", durationSeconds: 60))
+        syncIdlePreviewState()
         save()
     }
 
@@ -96,11 +130,13 @@ final class WorkoutViewModel: NSObject, ObservableObject {
         if segments.isEmpty {
             segments = .starterIntervals
         }
+        syncIdlePreviewState()
         save()
     }
 
     func moveSegments(from source: IndexSet, to destination: Int) {
         segments.move(fromOffsets: source, toOffset: destination)
+        syncIdlePreviewState()
         save()
     }
 
@@ -109,8 +145,10 @@ final class WorkoutViewModel: NSObject, ObservableObject {
         let clampedMinutes = max(0, minutes)
         let clampedSeconds = min(max(0, seconds), 59)
         let totalSeconds = max(5, (clampedMinutes * 60) + clampedSeconds)
-        segments[index].title = title.isEmpty ? "Interval" : title
+        segments[index].title = title
         segments[index].durationSeconds = totalSeconds
+        segments[index].cueRole = IntervalCueRole.inferred(from: segments[index].displayTitle)
+        syncIdlePreviewState()
         save()
     }
 
@@ -164,6 +202,10 @@ final class WorkoutViewModel: NSObject, ObservableObject {
         setIdleTimer(disabled: false)
     }
 
+    func finishWorkout() {
+        finishWorkout(playCue: true)
+    }
+
     func format(seconds: Int) -> String {
         let minutes = max(0, seconds) / 60
         let remainingSeconds = max(0, seconds) % 60
@@ -174,11 +216,15 @@ final class WorkoutViewModel: NSObject, ObservableObject {
         if let data = UserDefaults.standard.data(forKey: saveKey),
            let saved = try? JSONDecoder().decode(SavedWorkoutConfig.self, from: data) {
             segments = saved.segments.isEmpty ? .starterIntervals : saved.segments
+            repeatMode = saved.repeatMode
             rounds = max(1, saved.rounds)
-            enableVoice = saved.enableVoice
-            enableSound = saved.enableSound
+            audioMode = saved.audioMode
+            announcementType = saved.announcementType
+            announcementLanguage = saved.announcementLanguage
+            voiceIdentifier = saved.voiceIdentifier
         } else {
             segments = .starterIntervals
+            repeatMode = .unlimited
         }
 
         secondsRemaining = segments.first?.durationSeconds ?? 0
@@ -188,8 +234,11 @@ final class WorkoutViewModel: NSObject, ObservableObject {
         let config = SavedWorkoutConfig(
             segments: segments,
             rounds: rounds,
-            enableVoice: enableVoice,
-            enableSound: enableSound
+            repeatMode: repeatMode,
+            audioMode: audioMode,
+            announcementType: announcementType,
+            announcementLanguage: announcementLanguage,
+            voiceIdentifier: voiceIdentifier
         )
 
         if let encoded = try? JSONEncoder().encode(config) {
@@ -218,7 +267,13 @@ final class WorkoutViewModel: NSObject, ObservableObject {
                 scheduleNotifications()
                 announceCurrentSegment(prefix: "Start")
             } else if countdownToStart <= 3 {
-                speak("\(countdownToStart)")
+                audioCueManager.speakCountdown(
+                    "\(countdownToStart)",
+                    audioMode: audioMode,
+                    announcementType: announcementType,
+                    language: announcementLanguage,
+                    voiceIdentifier: voiceIdentifier
+                )
             }
 
             return
@@ -237,11 +292,14 @@ final class WorkoutViewModel: NSObject, ObservableObject {
     private func advanceSegment() {
         if currentSegmentIndex < segments.count - 1 {
             currentSegmentIndex += 1
+        } else if repeatMode == .unlimited {
+            currentRound += 1
+            currentSegmentIndex = 0
         } else if currentRound < rounds {
             currentRound += 1
             currentSegmentIndex = 0
         } else {
-            finishWorkout()
+            finishWorkout(playCue: true)
             return
         }
 
@@ -249,7 +307,7 @@ final class WorkoutViewModel: NSObject, ObservableObject {
         announceCurrentSegment(prefix: "Ted")
     }
 
-    private func finishWorkout() {
+    private func finishWorkout(playCue: Bool) {
         timer?.invalidate()
         timer = nil
         isRunning = false
@@ -259,29 +317,50 @@ final class WorkoutViewModel: NSObject, ObservableObject {
         removeScheduledNotifications()
         setIdleTimer(disabled: false)
         feedbackGenerator.notificationOccurred(.success)
-        playSound()
-        speak("Hotovo. Trenink skoncil.")
+        guard playCue else { return }
+        audioCueManager.playAnnouncement(
+            role: .finish,
+            phrase: finishPhrase,
+            audioMode: audioMode,
+            announcementType: announcementType,
+            language: announcementLanguage,
+            voiceIdentifier: voiceIdentifier
+        )
     }
 
     private func announceCurrentSegment(prefix: String) {
-        let title = currentSegment?.title ?? "interval"
-        let message = "\(prefix) \(title.lowercased())"
+        guard let currentSegment else { return }
+        let message = announcementPhrase(prefix: prefix, segment: currentSegment)
         feedbackGenerator.notificationOccurred(.warning)
-        playSound()
-        speak(message)
+        audioCueManager.playAnnouncement(
+            role: currentSegment.cueRole,
+            phrase: message,
+            audioMode: audioMode,
+            announcementType: announcementType,
+            language: announcementLanguage,
+            voiceIdentifier: voiceIdentifier
+        )
     }
 
-    private func playSound() {
-        guard enableSound else { return }
-        AudioServicesPlaySystemSound(1113)
+    private var finishPhrase: String {
+        switch announcementLanguage {
+        case .czech:
+            return "Hotovo. Trenink skoncil."
+        case .english:
+            return "Done. Workout finished."
+        }
     }
 
-    private func speak(_ message: String) {
-        guard enableVoice else { return }
-        let utterance = AVSpeechUtterance(string: message)
-        utterance.voice = AVSpeechSynthesisVoice(language: "cs-CZ") ?? AVSpeechSynthesisVoice(language: "en-US")
-        utterance.rate = 0.48
-        speaker.speak(utterance)
+    private func announcementPhrase(prefix: String, segment: IntervalSegment) -> String {
+        let title = segment.displayTitle.lowercased()
+
+        switch announcementLanguage {
+        case .czech:
+            return "\(prefix) \(title)"
+        case .english:
+            let englishPrefix = prefix == "Start" ? "Start" : "Now"
+            return "\(englishPrefix) \(title)"
+        }
     }
 
     private func scheduleNotifications() {
@@ -294,8 +373,10 @@ final class WorkoutViewModel: NSObject, ObservableObject {
         var roundIndex = currentRound - 1
         var segmentIndex = currentSegmentIndex
 
-        while roundIndex < rounds {
-            let isLastSegment = roundIndex == rounds - 1 && segmentIndex == segments.count - 1
+        while requestIndex < notificationScheduleLimit {
+            let isLastSegment = repeatMode == .fixedRounds
+                && roundIndex == rounds - 1
+                && segmentIndex == segments.count - 1
 
             if elapsed > 0 {
                 let content = UNMutableNotificationContent()
@@ -331,19 +412,28 @@ final class WorkoutViewModel: NSObject, ObservableObject {
     private func nextTitleAfter(round: Int, segment: Int) -> String {
         let nextSegmentIndex = segment + 1
         if segments.indices.contains(nextSegmentIndex) {
-            return segments[nextSegmentIndex].title
+            return segments[nextSegmentIndex].displayTitle
         }
 
-        if round + 1 < rounds {
-            return segments.first?.title ?? "Dalsi interval"
+        if repeatMode == .unlimited || round + 1 < rounds {
+            return segments.first?.displayTitle ?? "Dalsi interval"
         }
 
         return "Konec"
     }
 
     private func scheduledNotificationIDs() -> [String] {
-        let total = max(segments.count * rounds, 1)
+        let total = max(notificationScheduleLimit, 1)
         return (0..<total).map { "interval-run-coach-\($0)" }
+    }
+
+    private var notificationScheduleLimit: Int {
+        switch repeatMode {
+        case .unlimited:
+            return maxScheduledNotifications
+        case .fixedRounds:
+            return max(segments.count * rounds, 1)
+        }
     }
 
     private func removeScheduledNotifications() {
@@ -362,9 +452,10 @@ final class WorkoutViewModel: NSObject, ObservableObject {
     func applyPreset(runSeconds: Int, walkSeconds: Int, rounds: Int) {
         guard !isRunning, !isPaused else { return }
         self.segments = [
-            IntervalSegment(title: "Beh", durationSeconds: runSeconds),
-            IntervalSegment(title: "Chuze", durationSeconds: walkSeconds)
+            IntervalSegment(title: "Beh", durationSeconds: runSeconds, cueRole: .run),
+            IntervalSegment(title: "Chuze", durationSeconds: walkSeconds, cueRole: .walk)
         ]
+        self.repeatMode = .fixedRounds
         self.rounds = max(1, rounds)
         self.secondsRemaining = self.segments.first?.durationSeconds ?? 0
         save()
@@ -387,11 +478,91 @@ final class WorkoutViewModel: NSObject, ObservableObject {
             notificationPermissionState = "Nezname"
         }
     }
+
+    private func syncIdlePreviewState() {
+        guard !isWorkoutActive else { return }
+        currentSegmentIndex = 0
+        currentRound = 1
+        secondsRemaining = segments.first?.durationSeconds ?? 0
+    }
 }
 
 private struct SavedWorkoutConfig: Codable {
     var segments: [IntervalSegment]
     var rounds: Int
-    var enableVoice: Bool
-    var enableSound: Bool
+    var repeatMode: RepeatMode
+    var audioMode: AudioMode
+    var announcementType: AnnouncementType
+    var announcementLanguage: AnnouncementLanguage
+    var voiceIdentifier: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case segments
+        case rounds
+        case repeatMode
+        case audioMode
+        case announcementType
+        case announcementLanguage
+        case voiceIdentifier
+        case enableVoice
+        case enableSound
+    }
+
+    init(
+        segments: [IntervalSegment],
+        rounds: Int,
+        repeatMode: RepeatMode,
+        audioMode: AudioMode,
+        announcementType: AnnouncementType,
+        announcementLanguage: AnnouncementLanguage,
+        voiceIdentifier: String?
+    ) {
+        self.segments = segments
+        self.rounds = rounds
+        self.repeatMode = repeatMode
+        self.audioMode = audioMode
+        self.announcementType = announcementType
+        self.announcementLanguage = announcementLanguage
+        self.voiceIdentifier = voiceIdentifier
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+
+        segments = try container.decodeIfPresent([IntervalSegment].self, forKey: .segments) ?? []
+        rounds = try container.decodeIfPresent(Int.self, forKey: .rounds) ?? 6
+        repeatMode = try container.decodeIfPresent(RepeatMode.self, forKey: .repeatMode) ?? .unlimited
+        audioMode = try container.decodeIfPresent(AudioMode.self, forKey: .audioMode) ?? .duck
+        announcementLanguage = try container.decodeIfPresent(AnnouncementLanguage.self, forKey: .announcementLanguage) ?? .czech
+        voiceIdentifier = try container.decodeIfPresent(String.self, forKey: .voiceIdentifier)
+
+        if let savedAnnouncementType = try container.decodeIfPresent(AnnouncementType.self, forKey: .announcementType) {
+            announcementType = savedAnnouncementType
+        } else {
+            let oldVoice = try container.decodeIfPresent(Bool.self, forKey: .enableVoice) ?? true
+            let oldSound = try container.decodeIfPresent(Bool.self, forKey: .enableSound) ?? true
+
+            switch (oldVoice, oldSound) {
+            case (true, true):
+                announcementType = .voiceAndSound
+            case (true, false):
+                announcementType = .voice
+            case (false, true):
+                announcementType = .sound
+            case (false, false):
+                announcementType = .off
+            }
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(segments, forKey: .segments)
+        try container.encode(rounds, forKey: .rounds)
+        try container.encode(repeatMode, forKey: .repeatMode)
+        try container.encode(audioMode, forKey: .audioMode)
+        try container.encode(announcementType, forKey: .announcementType)
+        try container.encode(announcementLanguage, forKey: .announcementLanguage)
+        try container.encodeIfPresent(voiceIdentifier, forKey: .voiceIdentifier)
+    }
 }
